@@ -210,3 +210,44 @@ def test_digests_skip_mismatched_hash():
     ib.save_report_image("e" * 64, b"img", "x.png", "")
     assert ib.find_by_digest("e" * 64) is None
     assert ib.find_by_digest(ib.compute_digests(b"img")["md5"]) is None
+
+
+def test_pdq_catches_rotated_and_mirrored_copies():
+    import io
+
+    from PIL import Image
+
+    original = _photo(11, size=(400, 300))
+    h = ib.compute_hash_bytes(original)
+    pdq = ib.compute_pdq(original)
+    assert pdq is not None and len(f"{pdq:064x}") == 64
+
+    def turned(op) -> bytes:
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(original)).transpose(op).save(buf, "JPEG", quality=80)
+        return buf.getvalue()
+
+    copies = [turned(Image.Transpose.ROTATE_90), turned(Image.Transpose.FLIP_LEFT_RIGHT)]
+    # dHash alone misses these.
+    for copy in copies:
+        assert (ib.compute_phash(copy) ^ ib.compute_phash(original)).bit_count() > ib.PHASH_MAX_DISTANCE
+
+    ib.add_to_blacklist(h, source="manual", data=original)
+    row = next(r for r in ib.list_blacklist() if r["hash"] == h)
+    assert row["pdq"] == f"{pdq:064x}"
+    for copy in copies:
+        assert ib._match_pdq(copy) == h
+        assert ib.match_image(copy) == h
+    assert ib._match_pdq(_photo(12, size=(400, 300))) is None
+    ib.remove_from_blacklist(h)
+
+
+def test_flat_image_has_no_pdq():
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (100, 100), (40, 40, 40)).save(buf, "PNG")
+    assert ib.compute_pdq(buf.getvalue()) is None
+    assert ib.compute_pdq(b"not an image") is None

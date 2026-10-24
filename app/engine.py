@@ -1,7 +1,8 @@
 """Image blacklist engine of the image-spam-checker service.
 
-Images match by exact SHA-256, by perceptual hash (re-encodes, resizes)
-or by ORB feature matching when they share at least 60% of either image
+Images match by exact SHA-256, by perceptual hash (dHash for re-encodes
+and resizes, Meta's PDQ for the same plus rotations and flips) or by ORB
+feature matching when they share at least 60% of either image
 (crops, captions, collages) — see ``match_image``. Every image the service
 keeps (reported or blacklisted) also gets MD5, SHA-1, SHA-512, SHA3-256 and
 BLAKE2b digests in ``image_digests``, so hashes from other tools or shared
@@ -42,6 +43,12 @@ try:
 except ImportError:  # partial matching is skipped without OpenCV
     cv2 = None
 
+try:
+    import numpy as np
+    import pdqhash
+except ImportError:  # PDQ matching is skipped without it
+    pdqhash = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +77,20 @@ _phash_cache: dict[str, int] = {}
 # Bits (out of 64) two dHashes may differ by and still count as the same
 # picture. Re-encodes and resizes land around 0-4.
 PHASH_MAX_DISTANCE = 6
+
+# sha256 -> 256-bit PDQ hash of blacklisted images. PDQ is Meta's open
+# perceptual hash, the format hash-sharing programs exchange. It is
+# sturdier than the 64-bit dHash and, hashing an incoming image in all
+# eight rotations/flips, also catches rotated or mirrored copies.
+_pdq_cache: dict[str, int] = {}
+
+# Meta's recommended values: hashes within 31 of 256 bits are the same
+# picture, and hashes with quality below 50 (near-flat images) are noise.
+PDQ_MAX_DISTANCE = 31
+PDQ_MIN_QUALITY = 50
+# PDQ shrinks to 64x64 internally; hashing a pre-shrunk copy keeps a huge
+# upload from allocating gigabytes of float buffers.
+_PDQ_SIDE = 1024
 
 # sha256 -> ORB features of blacklisted images, for catching crops and
 # images pasted into a bigger one (meme captions, collages), which change
@@ -173,6 +194,9 @@ def init() -> None:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(blacklist)")}
             if "phash" not in cols:
                 conn.execute("ALTER TABLE blacklist ADD COLUMN phash TEXT")
+            # 64 hex chars; '' when computed but too low quality to use.
+            if "pdq" not in cols:
+                conn.execute("ALTER TABLE blacklist ADD COLUMN pdq TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -187,7 +211,7 @@ def load_cache() -> None:
     ``set()`` rebind, so concurrent readers from ``is_blacklisted`` will
     see either the old set or the new set, never a half-built one.
     """
-    global _cache, _phash_cache, _feature_cache, _cache_loaded
+    global _cache, _phash_cache, _pdq_cache, _feature_cache, _cache_loaded
     init()
     with _lock:
         if _cache_loaded:
@@ -202,12 +226,20 @@ def load_cache() -> None:
             ).fetchall():
                 _insert_digests(conn, h, data)
             rows = conn.execute(
-                "SELECT b.hash, b.phash, i.data FROM blacklist b "
+                "SELECT b.hash, b.phash, b.pdq, i.data FROM blacklist b "
                 "LEFT JOIN report_images i ON i.hash = b.hash"
             ).fetchall()
             phashes: dict[str, int] = {}
+            pdqs: dict[str, int] = {}
             features: dict[str, tuple] = {}
-            for h, ph, data in rows:
+            for h, ph, pdq, data in rows:
+                if pdq is None and data and pdqhash is not None:
+                    # Rows blacklisted before PDQ was added.
+                    pdq_int = compute_pdq(data)
+                    pdq = f"{pdq_int:064x}" if pdq_int is not None else ""
+                    conn.execute("UPDATE blacklist SET pdq = ? WHERE hash = ?", (pdq, h))
+                if pdq:
+                    pdqs[h] = int(pdq, 16)
                 if ph is None and data:
                     # Rows blacklisted before perceptual hashing existed.
                     ph_int = compute_phash(data)
@@ -232,6 +264,7 @@ def load_cache() -> None:
             conn.close()
         _cache = {r[0] for r in rows}
         _phash_cache = phashes
+        _pdq_cache = pdqs
         _feature_cache = features
         _cache_loaded = True
 
@@ -312,6 +345,54 @@ def compute_phash(data: bytes) -> int | None:
     if not 8 <= bits.bit_count() <= 56:
         return None
     return bits
+
+
+def _pdq_hashes(data: bytes, dihedral: bool = False) -> list[int]:
+    """PDQ hash of ``data`` (all eight rotations/flips if ``dihedral``),
+    or [] when PDQ is unavailable, the image undecodable or too flat."""
+    if pdqhash is None:
+        return []
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.draft("RGB", (_PDQ_SIDE, _PDQ_SIDE))
+            rgb = img.convert("RGB")
+        rgb.thumbnail((_PDQ_SIDE, _PDQ_SIDE))
+        arr = np.asarray(rgb)
+        if dihedral:
+            vectors, quality = pdqhash.compute_dihedral(arr)
+        else:
+            vector, quality = pdqhash.compute(arr)
+            vectors = [vector]
+    except Exception:
+        return []
+    if quality < PDQ_MIN_QUALITY:
+        return []
+    # Bits come most significant first, so this is the usual 64-hex PDQ form.
+    return [int("".join("1" if b else "0" for b in v), 2) for v in vectors]
+
+
+def compute_pdq(data: bytes) -> int | None:
+    """256-bit PDQ hash of an image, or None (see ``_pdq_hashes``).
+
+    Format it with ``f"{h:064x}"`` to compare with PDQ hashes from other
+    tools. CPU-bound — call via ``asyncio.to_thread``.
+    """
+    hashes = _pdq_hashes(data)
+    return hashes[0] if hashes else None
+
+
+def _match_pdq(data: bytes) -> str | None:
+    """Blacklisted image nearest to any rotation/flip of ``data`` by PDQ."""
+    if not _pdq_cache:
+        return None
+    candidates = _pdq_hashes(data, dihedral=True)
+    best, best_dist = None, PDQ_MAX_DISTANCE + 1
+    for bh, bpdq in list(_pdq_cache.items()):
+        for q in candidates:
+            dist = (q ^ bpdq).bit_count()
+            if dist < best_dist:
+                best, best_dist = bh, dist
+    return best
 
 
 def _has_near_duplicate(ph: int | None, phashes: dict[str, int]) -> bool:
@@ -456,7 +537,8 @@ def match_image(data: bytes) -> str | None:
     """SHA-256 of the blacklisted image ``data`` matches, or None.
 
     Exact SHA-256 first, then the nearest perceptual hash within
-    ``PHASH_MAX_DISTANCE``, then a partial match (crop or paste) covering
+    ``PHASH_MAX_DISTANCE``, then the nearest PDQ hash of any rotation or
+    flip within ``PDQ_MAX_DISTANCE``, then a partial match (crop or paste) covering
     ``PARTIAL_MATCH_RATIO`` of either image. CPU-bound — call via
     ``asyncio.to_thread``.
     """
@@ -472,7 +554,7 @@ def match_image(data: bytes) -> str | None:
                 best, best_dist = bh, dist
         if best:
             return best
-    return _match_partial(data)
+    return _match_pdq(data) or _match_partial(data)
 
 
 def is_blacklisted(hash_hex: str) -> bool:
@@ -507,6 +589,7 @@ def add_to_blacklist(
         found = get_report_image(hash_hex)
         data = found[0] if found else None
     ph = compute_phash(data) if data else None
+    pdq = compute_pdq(data) if data else None
     # A near-identical copy that already has features covers this one; two
     # sets of the same keypoints would fail each other's ratio test.
     feat = (
@@ -517,14 +600,15 @@ def add_to_blacklist(
     conn = _connect()
     try:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO blacklist (hash, added_at, added_by, source, phash) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO blacklist "
+            "(hash, added_at, added_by, source, phash, pdq) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 hash_hex,
                 int(time.time()),
                 added_by,
                 source,
                 f"{ph:016x}" if ph is not None else None,
+                f"{pdq:064x}" if pdq is not None else ("" if data and pdqhash else None),
             ),
         )
         if data:
@@ -537,6 +621,8 @@ def add_to_blacklist(
         _cache.add(hash_hex)
         if ph is not None:
             _phash_cache[hash_hex] = ph
+        if pdq is not None:
+            _pdq_cache[hash_hex] = pdq
         if feat is not None:
             _feature_cache[hash_hex] = feat[:3]
     return added
@@ -565,6 +651,7 @@ def remove_from_blacklist(hash_hex: str) -> bool:
     # even if the row was already gone (e.g. concurrent owner action).
     _cache.discard(hash_hex)
     _phash_cache.pop(hash_hex, None)
+    _pdq_cache.pop(hash_hex, None)
     _feature_cache.pop(hash_hex, None)
     return removed
 
@@ -580,7 +667,7 @@ def list_blacklist() -> list[dict]:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            f"SELECT b.hash, b.added_at, b.added_by, b.source, b.phash, {_DIGEST_COLS} "
+            f"SELECT b.hash, b.added_at, b.added_by, b.source, b.phash, NULLIF(b.pdq, '') AS pdq, {_DIGEST_COLS} "
             "FROM blacklist b LEFT JOIN image_digests d ON d.sha256 = b.hash "
             "ORDER BY b.added_at DESC"
         ).fetchall()

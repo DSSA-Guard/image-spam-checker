@@ -4,7 +4,8 @@
 
 ## 하는 일
 
-- 업로드된 이미지가 차단 목록에 있는지 검사: SHA-256 → 지각 해시(dHash) → ORB 특징점 부분 매칭(잘라내기·붙여넣기, 60% 이상 겹침)
+- 업로드된 이미지가 차단 목록에 있는지 검사: SHA-256 → 지각 해시(dHash) → PDQ 해시(회전·좌우/상하 반전 포함 8방향) → ORB 특징점 부분 매칭(잘라내기·붙여넣기, 60% 이상 겹침)
+  - PDQ는 Meta가 공개한 256비트 지각 해시예요. Meta 권장값대로 256비트 중 31비트 이하로 다르면 같은 이미지로 보고, 품질 점수가 50 미만인(거의 단색인) 이미지는 PDQ 비교에서 빠져요.
 - 신고되거나 차단된 이미지는 SHA-256 말고도 MD5, SHA-1, SHA-512, SHA3-256, BLAKE2b 해시를 함께 저장해요. 다른 도구나 공유 차단 목록에서 받은 해시로도 이미지를 찾아볼 수 있어요.
 - 멤버 신고 기록, 서로 다른 5명이 신고하면 자동 차단
 - 신고 대기 목록, 신고 이미지 사본 보관, 수동 차단/해제
@@ -42,7 +43,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 9000
 | POST | `/v1/reports` | multipart `image`, `reporter_id`, `filename`, `jump_url` → `status`: `recorded` / `duplicate` / `blocked` / `auto_blocked` |
 | GET | `/v1/reports/pending?limit=50` | 아직 차단되지 않은 신고 목록 |
 | GET | `/v1/images/{hash}` | 보관된 신고 이미지 (확장자는 `X-Filename-Ext` 헤더) |
-| GET | `/v1/blacklist` | 차단 목록 (저장된 `md5`, `sha1`, `sha512`, `sha3_256`, `blake2b` 포함) |
+| GET | `/v1/blacklist` | 차단 목록 (`pdq` 해시와 저장된 `md5`, `sha1`, `sha512`, `sha3_256`, `blake2b` 포함) |
 | GET | `/v1/digests/{해시}` | MD5·SHA-1·SHA-256·SHA-512·SHA3-256·BLAKE2b 중 아무 해시로 조회 → `{"digests": {...}, "blacklisted": bool}`, 없으면 404 |
 | PUT | `/v1/blacklist/{hash}` | JSON `{added_by, source}` 로 차단 |
 | DELETE | `/v1/blacklist/{hash}` | 차단 해제 (신고 기록도 초기화) |
