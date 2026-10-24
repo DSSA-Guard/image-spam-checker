@@ -139,7 +139,25 @@ def _block(img) -> str:
     return h
 
 
-def test_partial_copies_covering_60_percent_are_caught():
+import pytest
+
+
+@pytest.fixture(params=["flat", "ivf", "brute_force"])
+def orb_mode(request, monkeypatch):
+    """Run against each ORB search backend: faiss exact scan, faiss IVF
+    clusters, and chunked OpenCV brute force when faiss is missing."""
+    if request.param == "ivf":
+        monkeypatch.setattr(ib, "_ORB_FLAT_ROWS", 500)
+    elif request.param == "brute_force":
+        monkeypatch.setattr(ib, "faiss", None)
+        monkeypatch.setattr(ib, "_BF_CHUNK", 700)  # several chunks to merge
+    ib._orb_index.rebuild({h: f[1] for h, f in ib._feature_cache.items()})
+    yield
+    monkeypatch.undo()
+    ib._orb_index.rebuild({h: f[1] for h, f in ib._feature_cache.items()})
+
+
+def test_partial_copies_covering_60_percent_are_caught(orb_mode):
     from PIL import Image, ImageDraw
 
     banned = _scene(1)
@@ -251,3 +269,24 @@ def test_flat_image_has_no_pdq():
     Image.new("RGB", (100, 100), (40, 40, 40)).save(buf, "PNG")
     assert ib.compute_pdq(buf.getvalue()) is None
     assert ib.compute_pdq(b"not an image") is None
+
+
+def test_orb_index_skips_removed_images_until_rebuild():
+    import numpy as np
+
+    rng = np.random.default_rng(1)
+    descs = {f"{i:064x}": rng.integers(0, 256, (50, 32), dtype=np.uint8) for i in range(4)}
+    hashes = list(descs)
+    index = ib._OrbIndex()
+    index.rebuild({h: descs[h] for h in hashes[:2]})
+    for h in hashes[2:]:
+        index.add(h, descs[h])
+
+    pairs = index.search(descs[hashes[3]])
+    assert set(pairs) == {hashes[3]}
+    assert sorted(pairs[hashes[3]]) == [(i, i) for i in range(50)]
+    index.remove(hashes[3])
+    assert index.search(descs[hashes[3]]) == {} and len(index) == 3
+
+    index.rebuild({h: descs[h] for h in hashes[:3]})  # restart drops dead rows
+    assert index._rows == 150 and set(index.search(descs[hashes[2]])) == {hashes[2]}

@@ -49,6 +49,11 @@ try:
 except ImportError:  # PDQ matching is skipped without it
     pdqhash = None
 
+try:
+    import faiss
+except ImportError:  # ORB search falls back to chunked brute force
+    faiss = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,6 +114,14 @@ _ORB_NEW_SIDE = 1024
 _ORB_NEW_FEATURES = 2000
 _MIN_INLIERS = 20
 _CELL = 16  # pixel-check grid, in px of the shrunk image
+
+# Up to this many descriptor rows (~40 blacklisted images) the ORB index is
+# an exact scan. Past it, an IVF index clusters the rows and each query
+# descriptor only scans its _ORB_NPROBE nearest clusters.
+_ORB_FLAT_ROWS = 20_000
+_ORB_NPROBE = 4
+# OpenCV's matcher refuses 2**18 or more train rows in one call.
+_BF_CHUNK = 200_000
 
 
 # Algorithms kept per image besides SHA-256, which stays the primary key.
@@ -266,6 +279,8 @@ def load_cache() -> None:
         _phash_cache = phashes
         _pdq_cache = pdqs
         _feature_cache = features
+        if cv2 is not None:
+            _orb_index.rebuild({h: f[1] for h, f in features.items()})
         _cache_loaded = True
 
 
@@ -436,6 +451,130 @@ def compute_features(
     return pts, desc, (arr.shape[1], arr.shape[0]), arr
 
 
+class _OrbIndex:
+    """Nearest-neighbour search over every blacklisted image's ORB descriptors.
+
+    Brute force against all of them costs time in proportion to the
+    blacklist (~2s per incoming image at 1,000 blacklisted images), so the
+    descriptors live in a faiss index, built in ``load_cache`` and grown in
+    place. A removed image's rows stay in the index and are dropped from
+    results; the next ``rebuild`` (at restart) leaves them out and
+    re-clusters for the current size. Without faiss, search falls back to
+    OpenCV brute force in chunks.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owners: list[str | None] = []  # block -> hash, None once removed
+        self._descs: list = []  # block -> its descriptors
+        self._block_of: dict[str, int] = {}
+        self._starts = None  # block -> first row
+        self._rows = 0
+        self._index = None
+        self._bf_all = None  # stacked descriptors for the brute-force fallback
+
+    def __len__(self) -> int:
+        return len(self._block_of)
+
+    def rebuild(self, descs: dict[str, object]) -> None:
+        with self._lock:
+            self._owners = list(descs)
+            self._descs = [np.ascontiguousarray(d) for d in descs.values()]
+            self._block_of = {h: i for i, h in enumerate(self._owners)}
+            sizes = [len(d) for d in self._descs]
+            self._starts = np.cumsum([0] + sizes)[:-1].astype(np.int64)
+            self._rows = sum(sizes)
+            self._build()
+
+    def _build(self) -> None:
+        self._index = self._bf_all = None
+        n = self._rows
+        if faiss is None or n == 0:
+            return
+        stacked = np.vstack(self._descs)
+        if n <= _ORB_FLAT_ROWS:
+            index = faiss.IndexBinaryFlat(256)
+        else:
+            nlist = min(4096, max(64, n // 1000))
+            index = faiss.IndexBinaryIVF(faiss.IndexBinaryFlat(256), 256, nlist)
+            # k-means needs ~39 points per cluster; more only slows training.
+            pick = np.random.default_rng(0).choice(n, min(n, nlist * 39), replace=False)
+            index.train(stacked[np.sort(pick)])
+            index.nprobe = _ORB_NPROBE
+        index.add(stacked)
+        self._index = index
+
+    def add(self, hash_hex: str, desc) -> None:
+        with self._lock:
+            if hash_hex in self._block_of:
+                return
+            desc = np.ascontiguousarray(desc)
+            self._block_of[hash_hex] = len(self._owners)
+            self._owners.append(hash_hex)
+            self._descs.append(desc)
+            start = np.array([self._rows], np.int64)
+            self._starts = start if self._starts is None else np.concatenate([self._starts, start])
+            self._rows += len(desc)
+            self._bf_all = None
+            flat = isinstance(self._index, faiss.IndexBinaryFlat) if faiss else False
+            if faiss is not None and (self._index is None or (flat and self._rows > _ORB_FLAT_ROWS)):
+                self._build()  # first image, or outgrew the exact scan
+            elif self._index is not None:
+                self._index.add(desc)
+
+    def remove(self, hash_hex: str) -> None:
+        with self._lock:
+            block = self._block_of.pop(hash_hex, None)
+            if block is not None:
+                self._owners[block] = None
+
+    def search(self, query) -> dict[str, list[tuple[int, int]]]:
+        """Blacklisted hash -> [(its descriptor idx, query descriptor idx)]
+        for every query descriptor whose nearest neighbour passes Lowe's
+        ratio test."""
+        with self._lock:
+            if not self._block_of:
+                return {}
+            if self._index is not None:
+                D, I = self._index.search(np.ascontiguousarray(query), 2)
+            else:
+                D, I = self._brute_force(query)
+            # Lowe ratio test. Near-duplicate blacklisted copies would cancel
+            # each other out here, which is why only one of them keeps features.
+            ok = (I[:, 0] >= 0) & ((I[:, 1] < 0) | (D[:, 0] < 0.75 * D[:, 1]))
+            rows = I[ok, 0]
+            blocks = np.searchsorted(self._starts, rows, side="right") - 1
+            local = rows - self._starts[blocks]
+            owners = self._owners
+        pairs: dict[str, list[tuple[int, int]]] = {}
+        for b, li, qi in zip(blocks.tolist(), local.tolist(), np.nonzero(ok)[0].tolist()):
+            h = owners[b]
+            if h is not None:
+                pairs.setdefault(h, []).append((li, qi))
+        return pairs
+
+    def _brute_force(self, query):
+        if self._bf_all is None:
+            self._bf_all = np.vstack(self._descs)
+        D = np.full((len(query), 2), np.inf)
+        I = np.full((len(query), 2), -1, np.int64)
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        for start in range(0, len(self._bf_all), _BF_CHUNK):
+            chunk = self._bf_all[start : start + _BF_CHUNK]
+            for m in matcher.knnMatch(query, chunk, k=2):
+                for x in m:
+                    q, d, r = x.queryIdx, x.distance, x.trainIdx + start
+                    if d < D[q, 0]:
+                        D[q, 1], I[q, 1] = D[q, 0], I[q, 0]
+                        D[q, 0], I[q, 0] = d, r
+                    elif d < D[q, 1]:
+                        D[q, 1], I[q, 1] = d, r
+        return D, I
+
+
+_orb_index = _OrbIndex()
+
+
 def _homography(src, dst):
     """Banned -> new image homography from matched points, or None."""
     if len(src) < _MIN_INLIERS:
@@ -491,31 +630,20 @@ def _partial_ratio(new_arr, banned_arr, H) -> float:
 
 
 def _match_partial(data: bytes) -> str | None:
-    items = list(_feature_cache.items())
-    if not items:
+    if not len(_orb_index):
         return None
     new = compute_features(data, _ORB_NEW_SIDE, _ORB_NEW_FEATURES)
     if new is None:
         return None
-    # One brute-force pass against every blacklisted image's descriptors at
-    # once; only images with enough matches go on to the costlier checks.
-    descs = np.vstack([f[1] for _, f in items])
-    owner = np.concatenate([np.full(len(f[1]), i) for i, (_, f) in enumerate(items)])
-    start = np.concatenate([[0], np.cumsum([len(f[1]) for _, f in items])[:-1]])
-    pairs: dict[int, list[tuple[int, int]]] = {}
-    for m in cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(new[1], descs, k=2):
-        if not m:
-            continue
-        # Lowe ratio test. Near-duplicate blacklisted copies would cancel
-        # each other out here, which is why only one of them keeps features.
-        if len(m) == 2 and m[0].distance >= 0.75 * m[1].distance:
-            continue
-        i = int(owner[m[0].trainIdx])
-        pairs.setdefault(i, []).append((m[0].trainIdx - start[i], m[0].queryIdx))
-    for i, idx in sorted(pairs.items(), key=lambda kv: -len(kv[1])):
+    # One index lookup for all query descriptors; only images with enough
+    # matches go on to the costlier checks.
+    pairs = _orb_index.search(new[1])
+    for bh, idx in sorted(pairs.items(), key=lambda kv: -len(kv[1])):
         if len(idx) < _MIN_INLIERS:
             break
-        bh, banned = items[i]
+        banned = _feature_cache.get(bh)
+        if banned is None:
+            continue
         H = _homography(
             banned[0][[b for b, _ in idx]], new[0][[n for _, n in idx]]
         )
@@ -625,6 +753,7 @@ def add_to_blacklist(
             _pdq_cache[hash_hex] = pdq
         if feat is not None:
             _feature_cache[hash_hex] = feat[:3]
+            _orb_index.add(hash_hex, feat[1])
     return added
 
 
@@ -653,6 +782,7 @@ def remove_from_blacklist(hash_hex: str) -> bool:
     _phash_cache.pop(hash_hex, None)
     _pdq_cache.pop(hash_hex, None)
     _feature_cache.pop(hash_hex, None)
+    _orb_index.remove(hash_hex)
     return removed
 
 
