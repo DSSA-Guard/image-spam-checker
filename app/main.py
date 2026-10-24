@@ -2,7 +2,7 @@
 
 The Discord bot (and its web panel) talk to this instead of loading
 OpenCV and the blacklist database themselves. Every route except
-``/health`` needs ``Authorization: Bearer $IMAGE_CHECKER_TOKEN``.
+``/health`` needs ``Authorization: Bearer $IMAGE_CHECKER_API_KEY``.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ _HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _api_key()  # refuse to boot without a key
     # Builds perceptual hashes and ORB features for every blacklisted
     # image, so keep it off the event loop.
     await asyncio.to_thread(engine.load_cache)
@@ -37,10 +38,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="image-spam-checker", lifespan=lifespan)
 
 
+def _api_key() -> str:
+    key = os.getenv("IMAGE_CHECKER_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("환경 변수가 필요합니다: IMAGE_CHECKER_API_KEY")
+    return key
+
+
 def require_token(request: Request) -> None:
-    expected = os.getenv("IMAGE_CHECKER_TOKEN", "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="IMAGE_CHECKER_TOKEN is not configured")
+    expected = _api_key()
     got = request.headers.get("authorization", "")
     if not hmac.compare_digest(got.encode(), f"Bearer {expected}".encode()):
         raise HTTPException(status_code=401, detail="invalid token")

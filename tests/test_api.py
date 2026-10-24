@@ -5,7 +5,7 @@ import os
 import tempfile
 
 os.environ["IMAGE_CHECKER_DATA_DIR"] = tempfile.mkdtemp()
-os.environ["IMAGE_CHECKER_TOKEN"] = "secret"
+os.environ["IMAGE_CHECKER_API_KEY"] = "secret"
 
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
@@ -80,3 +80,12 @@ def test_pending_image_and_manual_block():
         assert r.json() == {"added": True}
         assert h not in {p["hash"] for p in c.get("/v1/reports/pending", headers=AUTH).json()}
         assert h in {b["hash"] for b in c.get("/v1/blacklist", headers=AUTH).json()}
+
+
+def test_refuses_to_start_without_key(monkeypatch):
+    import pytest
+
+    monkeypatch.delenv("IMAGE_CHECKER_API_KEY")
+    with pytest.raises(RuntimeError, match="IMAGE_CHECKER_API_KEY"):
+        with TestClient(app):
+            pass

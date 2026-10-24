@@ -12,12 +12,12 @@
 
 ```bash
 pip install -r requirements.txt
-export IMAGE_CHECKER_TOKEN=아주-긴-랜덤-문자열
+export IMAGE_CHECKER_API_KEY=아주-긴-랜덤-문자열
 export IMAGE_CHECKER_DATA_DIR=/data   # 기본값 ./data (SQLite 파일이 여기 저장돼요)
 uvicorn app.main:app --host 0.0.0.0 --port 9000
 ```
 
-`IMAGE_CHECKER_TOKEN`이 없으면 `/health`를 뺀 모든 요청이 503으로 거절돼요. 봇 쪽에는 같은 값을 `IMAGE_CHECKER_TOKEN`, 서버 주소를 `IMAGE_CHECKER_URL`로 넣어주세요. 워커는 1개로 돌려야 해요(차단 목록 캐시가 프로세스 메모리에 있어요).
+`IMAGE_CHECKER_API_KEY`가 없으면 서버가 시작되지 않아요. 봇 쪽에는 같은 값을 `IMAGE_CHECKER_API_KEY`, 서버 주소를 `IMAGE_CHECKER_API_URL`로 넣어주세요. 워커는 1개로 돌려야 해요(차단 목록 캐시가 프로세스 메모리에 있어요).
 
 ## API
 
