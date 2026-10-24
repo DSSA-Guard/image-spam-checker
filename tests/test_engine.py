@@ -171,3 +171,42 @@ def test_partial_copies_covering_60_percent_are_caught():
     assert ib.match_image(_jpeg(shared_logo)) is None
     for seed in range(100, 110):
         assert ib.match_image(_jpeg(_scene(seed))) is None
+
+
+def test_images_keep_digests_of_every_algorithm():
+    import hashlib
+
+    data = _photo(7)
+    h = ib.compute_hash_bytes(data)
+    ib.record_report(h, 1)
+    ib.save_report_image(h, data, "d.png", "")
+
+    want = {
+        "sha256": h,
+        "md5": hashlib.md5(data).hexdigest(),
+        "sha1": hashlib.sha1(data).hexdigest(),
+        "sha512": hashlib.sha512(data).hexdigest(),
+        "sha3_256": hashlib.sha3_256(data).hexdigest(),
+        "blake2b": hashlib.blake2b(data).hexdigest(),
+    }
+    assert ib.compute_digests(data) == want
+    for value in want.values():
+        assert ib.find_by_digest(value.upper()) == want
+    assert ib.find_by_digest("0" * 32) is None
+    assert ib.find_by_digest("not hex") is None
+
+    pending = next(r for r in ib.list_pending_reports(10) if r["hash"] == h)
+    assert pending["md5"] == want["md5"]
+
+    ib.add_to_blacklist(h)
+    row = next(r for r in ib.list_blacklist() if r["hash"] == h)
+    assert row["sha1"] == want["sha1"] and row["blake2b"] == want["blake2b"]
+
+    ib.remove_from_blacklist(h)
+    assert ib.find_by_digest(want["md5"]) is None
+
+
+def test_digests_skip_mismatched_hash():
+    ib.save_report_image("e" * 64, b"img", "x.png", "")
+    assert ib.find_by_digest("e" * 64) is None
+    assert ib.find_by_digest(ib.compute_digests(b"img")["md5"]) is None

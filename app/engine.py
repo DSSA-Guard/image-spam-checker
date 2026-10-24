@@ -2,7 +2,10 @@
 
 Images match by exact SHA-256, by perceptual hash (re-encodes, resizes)
 or by ORB feature matching when they share at least 60% of either image
-(crops, captions, collages) — see ``match_image``.
+(crops, captions, collages) — see ``match_image``. Every image the service
+keeps (reported or blacklisted) also gets MD5, SHA-1, SHA-512, SHA3-256 and
+BLAKE2b digests in ``image_digests``, so hashes from other tools or shared
+abuse lists can be looked up with ``find_by_digest``.
 
 Persists a bot-wide list of image content hashes that should be rejected
 by the bot's automod, plus a separate ``reports`` table that lets users flag
@@ -25,6 +28,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -86,6 +90,22 @@ _MIN_INLIERS = 20
 _CELL = 16  # pixel-check grid, in px of the shrunk image
 
 
+# Algorithms kept per image besides SHA-256, which stays the primary key.
+# Column name -> hashlib constructor name.
+DIGEST_ALGORITHMS = {
+    "md5": "md5",
+    "sha1": "sha1",
+    "sha512": "sha512",
+    "sha3_256": "sha3_256",
+    "blake2b": "blake2b",
+}
+_DIGEST_HEX_LEN = {
+    c: hashlib.new(a).digest_size * 2
+    for c, a in {"sha256": "sha256", **DIGEST_ALGORITHMS}.items()
+}
+_HEX_RE = re.compile(r"[0-9a-f]+")
+
+
 def _connect() -> sqlite3.Connection:
     # ``check_same_thread=False`` is required because the cog runs reads
     # from a different thread than the one that loaded the cog. Writes
@@ -131,6 +151,23 @@ def init() -> None:
                     filename TEXT,
                     jump_url TEXT
                 );
+
+                -- Other digests of every image the service has seen the
+                -- bytes of, keyed by its SHA-256. See ``DIGEST_ALGORITHMS``.
+                CREATE TABLE IF NOT EXISTS image_digests (
+                    sha256 TEXT PRIMARY KEY,
+                    md5 TEXT,
+                    sha1 TEXT,
+                    sha512 TEXT,
+                    sha3_256 TEXT,
+                    blake2b TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_digests_md5 ON image_digests(md5);
+                CREATE INDEX IF NOT EXISTS idx_digests_sha1 ON image_digests(sha1);
+                CREATE INDEX IF NOT EXISTS idx_digests_sha512 ON image_digests(sha512);
+                CREATE INDEX IF NOT EXISTS idx_digests_sha3_256 ON image_digests(sha3_256);
+                CREATE INDEX IF NOT EXISTS idx_digests_blake2b ON image_digests(blake2b);
                 """
             )
             cols = {r[1] for r in conn.execute("PRAGMA table_info(blacklist)")}
@@ -157,6 +194,13 @@ def load_cache() -> None:
             return
         conn = _connect()
         try:
+            # Stored images from before digests were kept.
+            for h, data in conn.execute(
+                "SELECT i.hash, i.data FROM report_images i "
+                "LEFT JOIN image_digests d ON d.sha256 = i.hash "
+                "WHERE i.data IS NOT NULL AND d.sha256 IS NULL"
+            ).fetchall():
+                _insert_digests(conn, h, data)
             rows = conn.execute(
                 "SELECT b.hash, b.phash, i.data FROM blacklist b "
                 "LEFT JOIN report_images i ON i.hash = b.hash"
@@ -195,6 +239,53 @@ def load_cache() -> None:
 def compute_hash_bytes(data: bytes) -> str:
     """Return the lowercase hex SHA-256 of raw attachment bytes."""
     return hashlib.sha256(data).hexdigest()
+
+
+def compute_digests(data: bytes) -> dict[str, str]:
+    """Hex digests of raw bytes: ``sha256`` plus every ``DIGEST_ALGORITHMS``."""
+    out = {"sha256": compute_hash_bytes(data)}
+    for col, algo in DIGEST_ALGORITHMS.items():
+        out[col] = hashlib.new(algo, data).hexdigest()
+    return out
+
+
+def _insert_digests(conn: sqlite3.Connection, hash_hex: str, data: bytes) -> None:
+    digests = compute_digests(data)
+    if digests["sha256"] != hash_hex:
+        # Callers may pass a hash that isn't these bytes' SHA-256 (tests,
+        # hand-typed hashes); storing it would link unrelated digests.
+        return
+    cols = ["sha256", *DIGEST_ALGORITHMS]
+    conn.execute(
+        f"INSERT OR IGNORE INTO image_digests ({', '.join(cols)}) "
+        f"VALUES ({', '.join('?' * len(cols))})",
+        [digests[c] for c in cols],
+    )
+
+
+def find_by_digest(value: str) -> dict[str, str] | None:
+    """Stored digests of the image whose digest (any algorithm) is ``value``.
+
+    The algorithm is told apart by length. SHA-256 and SHA3-256 share 64 hex
+    characters, as do SHA-512 and BLAKE2b at 128, so both columns are tried.
+    """
+    value = value.strip().lower()
+    if not _HEX_RE.fullmatch(value):
+        return None
+    cols = [c for c, n in _DIGEST_HEX_LEN.items() if n == len(value)]
+    if not cols:
+        return None
+    init()
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        where = " OR ".join(f"{c} = ?" for c in cols)
+        row = conn.execute(
+            f"SELECT * FROM image_digests WHERE {where} LIMIT 1", [value] * len(cols)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def compute_phash(data: bytes) -> int | None:
@@ -436,6 +527,8 @@ def add_to_blacklist(
                 f"{ph:016x}" if ph is not None else None,
             ),
         )
+        if data:
+            _insert_digests(conn, hash_hex, data)
         conn.commit()
         added = cur.rowcount > 0
     finally:
@@ -462,6 +555,7 @@ def remove_from_blacklist(hash_hex: str) -> bool:
         # Clear report rows first so a future re-report cycle starts at 0.
         conn.execute("DELETE FROM reports WHERE hash = ?", (hash_hex,))
         conn.execute("DELETE FROM report_images WHERE hash = ?", (hash_hex,))
+        conn.execute("DELETE FROM image_digests WHERE sha256 = ?", (hash_hex,))
         cur = conn.execute("DELETE FROM blacklist WHERE hash = ?", (hash_hex,))
         conn.commit()
         removed = cur.rowcount > 0
@@ -475,15 +569,20 @@ def remove_from_blacklist(hash_hex: str) -> bool:
     return removed
 
 
+_DIGEST_COLS = ", ".join(f"d.{c}" for c in DIGEST_ALGORITHMS)
+
+
 def list_blacklist() -> list[dict]:
-    """Return all blacklist rows, newest first."""
+    """Return all blacklist rows, newest first, with their stored digests
+    (None for hashes blocked without the image)."""
     init()
     conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT hash, added_at, added_by, source, phash FROM blacklist "
-            "ORDER BY added_at DESC"
+            f"SELECT b.hash, b.added_at, b.added_by, b.source, b.phash, {_DIGEST_COLS} "
+            "FROM blacklist b LEFT JOIN image_digests d ON d.sha256 = b.hash "
+            "ORDER BY b.added_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -532,10 +631,12 @@ MAX_STORED_IMAGE_BYTES = 8 * 1024 * 1024
 def save_report_image(
     hash_hex: str, data: bytes, filename: str, jump_url: str
 ) -> None:
-    """Keep the first reported copy of an image. Later calls are no-ops."""
+    """Keep the first reported copy of an image and its digests. Later
+    calls are no-ops. Digests are kept even when the file is too big."""
     init()
     conn = _connect()
     try:
+        _insert_digests(conn, hash_hex, data)
         conn.execute(
             "INSERT OR IGNORE INTO report_images (hash, data, filename, jump_url) "
             "VALUES (?, ?, ?, ?)",
@@ -554,8 +655,9 @@ def save_report_image(
 def list_pending_reports(limit: int) -> list[dict]:
     """Reported hashes not yet blacklisted, most recently reported first.
 
-    Each row: hash, count, last_reported_at, data, filename, jump_url
-    (the image columns are None for reports made before images were kept).
+    Each row: hash, count, last_reported_at, data, filename, jump_url and
+    the ``DIGEST_ALGORITHMS`` columns (None for reports made before images
+    or digests were kept).
     """
     init()
     conn = _connect()
@@ -563,8 +665,9 @@ def list_pending_reports(limit: int) -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT r.hash, COUNT(*) AS count, MAX(r.reported_at) AS last_reported_at, "
-            "i.data, i.filename, i.jump_url "
+            f"i.data, i.filename, i.jump_url, {_DIGEST_COLS} "
             "FROM reports r LEFT JOIN report_images i ON i.hash = r.hash "
+            "LEFT JOIN image_digests d ON d.sha256 = r.hash "
             "WHERE r.hash NOT IN (SELECT hash FROM blacklist) "
             "GROUP BY r.hash ORDER BY last_reported_at DESC LIMIT ?",
             (limit,),

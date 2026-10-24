@@ -77,10 +77,19 @@ def test_pending_image_and_manual_block():
         assert c.get(f"/v1/images/{'0' * 64}", headers=AUTH).status_code == 404
         assert c.get("/v1/images/not-a-hash", headers=AUTH).status_code == 404
 
+        import hashlib
+
+        md5 = hashlib.md5(data).hexdigest()
+        d = c.get(f"/v1/digests/{md5}", headers=AUTH).json()
+        assert d["digests"]["sha256"] == h and d["digests"]["md5"] == md5
+        assert d["blacklisted"] is False
+        assert c.get(f"/v1/digests/{'0' * 40}", headers=AUTH).status_code == 404
+
         r = c.put(f"/v1/blacklist/{h}", headers=AUTH, json={"added_by": "9", "source": "web_admin"})
         assert r.json() == {"added": True}
         assert h not in {p["hash"] for p in c.get("/v1/reports/pending", headers=AUTH).json()}
         assert h in {b["hash"] for b in c.get("/v1/blacklist", headers=AUTH).json()}
+        assert c.get(f"/v1/digests/{md5}", headers=AUTH).json()["blacklisted"] is True
 
 
 def test_refuses_to_start_without_admin_password(monkeypatch):

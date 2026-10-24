@@ -137,6 +137,17 @@ async def stored_image(hash_hex: str) -> Response:
     )
 
 
+@app.get("/v1/digests/{value}", dependencies=[Depends(require_token)])
+async def digests(value: str) -> dict:
+    """Every stored digest of the image whose MD5, SHA-1, SHA-256, SHA-512,
+    SHA3-256 or BLAKE2b is ``value``, and whether it is blacklisted."""
+    found = await asyncio.to_thread(engine.find_by_digest, value)
+    if not found:
+        raise HTTPException(status_code=404)
+    blocked = await asyncio.to_thread(engine.is_blacklisted, found["sha256"])
+    return {"digests": found, "blacklisted": blocked}
+
+
 class BlockBody(BaseModel):
     added_by: str = ""
     source: str = "manual"
