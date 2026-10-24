@@ -5,14 +5,15 @@ import os
 import tempfile
 
 os.environ["IMAGE_CHECKER_DATA_DIR"] = tempfile.mkdtemp()
-os.environ["IMAGE_CHECKER_API_KEY"] = "secret"
+os.environ["IMAGE_CHECKER_ADMIN_PASSWORD"] = "admin-pw"
 
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
+from app import keys
 from app.main import app
 
-AUTH = {"Authorization": "Bearer secret"}
+AUTH = {"Authorization": f"Bearer {keys.create_key('test')}"}
 
 
 def _png(seed: int) -> bytes:
@@ -82,10 +83,10 @@ def test_pending_image_and_manual_block():
         assert h in {b["hash"] for b in c.get("/v1/blacklist", headers=AUTH).json()}
 
 
-def test_refuses_to_start_without_key(monkeypatch):
+def test_refuses_to_start_without_admin_password(monkeypatch):
     import pytest
 
-    monkeypatch.delenv("IMAGE_CHECKER_API_KEY")
-    with pytest.raises(RuntimeError, match="IMAGE_CHECKER_API_KEY"):
+    monkeypatch.delenv("IMAGE_CHECKER_ADMIN_PASSWORD")
+    with pytest.raises(RuntimeError, match="IMAGE_CHECKER_ADMIN_PASSWORD"):
         with TestClient(app):
             pass

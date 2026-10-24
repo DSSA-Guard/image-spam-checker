@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block body %}
+<header>
+  <h1>이미지 검사 서버 관리</h1>
+  <form method="post" action="/admin/logout">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="ghost" type="submit">로그아웃</button>
+  </form>
+</header>
+
+<div class="stats">
+  <div class="card stat"><span class="muted">차단된 이미지</span><b>{{ blacklist_count }}</b></div>
+  <div class="card stat"><span class="muted">처리 대기 신고</span><b>{{ pending_count }}</b></div>
+  <div class="card stat"><span class="muted">사용 중인 API 키</span><b>{{ keys | selectattr("revoked_at", "none") | list | length }}</b></div>
+</div>
+
+{% if new_key %}
+<div class="card new-key">
+  <h2>새 API 키: {{ new_key.name }}</h2>
+  <div class="muted">지금 복사해 두세요. 이 화면을 벗어나면 다시 볼 수 없어요.</div>
+  <code>{{ new_key.key }}</code>
+  <div class="muted">봇 환경 변수 <code style="display:inline;padding:0;border:0;margin:0">IMAGE_CHECKER_API_KEY</code>에 넣으면 돼요.</div>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>API 키 발급</h2>
+  <form method="post" action="/admin/keys" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="text" name="name" maxlength="60" placeholder="어디에 쓸 키인지 (예: 디스코드 봇 운영)" required>
+    <button type="submit">발급</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>API 키 목록</h2>
+  {% if keys %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>이름</th><th>키 앞부분</th><th>발급</th><th>마지막 사용</th><th></th></tr></thead>
+    <tbody>
+    {% for k in keys %}
+      <tr class="{{ 'revoked' if k.revoked_at }}">
+        <td>{{ k.name }}</td>
+        <td><code>{{ k.prefix }}…</code></td>
+        <td>{{ k.created_at | ts }}</td>
+        <td>{{ k.last_used_at | ts }}</td>
+        <td>
+          {% if k.revoked_at %}
+            <span class="muted">폐기됨</span>
+          {% else %}
+          <form method="post" action="/admin/keys/{{ k.id }}/revoke" onsubmit="return confirm('이 키를 폐기할까요? 이 키를 쓰는 곳은 바로 막혀요.')">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <button class="danger" type="submit">폐기</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">아직 발급한 키가 없어요.</p>
+  {% endif %}
+</div>
+{% endblock %}

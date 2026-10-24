@@ -1,23 +1,24 @@
 """HTTP API of the image-spam-checker service.
 
 The Discord bot (and its web panel) talk to this instead of loading
-OpenCV and the blacklist database themselves. Every route except
-``/health`` needs ``Authorization: Bearer $IMAGE_CHECKER_API_KEY``.
+OpenCV and the blacklist database themselves. Every ``/v1`` route needs
+``Authorization: Bearer <key>`` with a key issued from the ``/admin`` page.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
-from app import engine
+from app import admin, engine, keys
 
 REPORT_THRESHOLD = 5
 # Discord caps attachments well below this; it only keeps a runaway upload
@@ -28,7 +29,7 @@ _HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _api_key()  # refuse to boot without a key
+    admin.admin_password()  # refuse to boot without one
     # Builds perceptual hashes and ORB features for every blacklisted
     # image, so keep it off the event loop.
     await asyncio.to_thread(engine.load_cache)
@@ -36,20 +37,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="image-spam-checker", lifespan=lifespan)
-
-
-def _api_key() -> str:
-    key = os.getenv("IMAGE_CHECKER_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("환경 변수가 필요합니다: IMAGE_CHECKER_API_KEY")
-    return key
+app.add_middleware(
+    SessionMiddleware,
+    # Without a fixed secret, admin sessions just end on restart.
+    secret_key=os.getenv("IMAGE_CHECKER_SESSION_SECRET") or secrets.token_urlsafe(32),
+    session_cookie="isc_admin",
+    max_age=12 * 3600,
+    same_site="strict",
+    https_only=os.getenv("IMAGE_CHECKER_COOKIE_SECURE", "") == "1",
+)
+app.include_router(admin.router)
 
 
 def require_token(request: Request) -> None:
-    expected = _api_key()
-    got = request.headers.get("authorization", "")
-    if not hmac.compare_digest(got.encode(), f"Bearer {expected}".encode()):
-        raise HTTPException(status_code=401, detail="invalid token")
+    # Sync on purpose: FastAPI runs it in the threadpool, so the occasional
+    # last-used write in ``keys.verify`` never blocks the event loop.
+    scheme, _, raw = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not raw or not keys.verify(raw.strip()):
+        raise HTTPException(status_code=401, detail="invalid API key")
 
 
 def _hash(hash_hex: str) -> str:

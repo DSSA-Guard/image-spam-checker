@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{% block title %}이미지 검사 서버{% endblock %}</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1d2129; --muted:#6b7280; --line:#e3e6ea; --accent:#2f6fde; --danger:#c93636; --ok-bg:#eaf6ee; --ok-line:#9fd4b1; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14161a; --card:#1d2026; --fg:#e7e9ee; --muted:#9aa1ad; --line:#2d3139; --accent:#6b9cff; --danger:#ff7a7a; --ok-bg:#16301f; --ok-line:#2f6b45; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 system-ui, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:24px; }
+h1 { font-size:20px; margin:0; }
+h2 { font-size:16px; margin:0 0 12px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+.muted { color:var(--muted); font-size:13px; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px; margin-bottom:16px; }
+.stats .card { margin:0; }
+.stat b { display:block; font-size:24px; }
+input[type=text], input[type=password] { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:7px; background:var(--bg); color:var(--fg); font:inherit; }
+button { padding:8px 14px; border-radius:7px; border:1px solid var(--accent); background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+button.ghost { background:transparent; color:var(--fg); border-color:var(--line); }
+button.danger { background:transparent; color:var(--danger); border-color:var(--danger); padding:4px 10px; font-size:13px; }
+.row { display:flex; gap:8px; }
+.row input { flex:1; }
+.table-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th, td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+th { color:var(--muted); font-weight:500; font-size:13px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; }
+.new-key { background:var(--ok-bg); border-color:var(--ok-line); }
+.new-key code { display:block; padding:10px; margin:8px 0; background:var(--card); border:1px solid var(--line); border-radius:6px; word-break:break-all; white-space:normal; user-select:all; }
+.revoked td { color:var(--muted); text-decoration: line-through; }
+.revoked td:last-child { text-decoration:none; }
+.error { color:var(--danger); font-size:14px; margin:0 0 10px; }
+</style>
+</head>
+<body><main>{% block body %}{% endblock %}</main></body>
+</html>
